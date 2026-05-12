@@ -34,7 +34,12 @@ CHAIN_ID = 1
 RPC = os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com")
 WALLET_FILE = os.environ.get("PFFT_WALLET", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallet.json"))
 GAS_LIMIT = int(os.environ.get("PFFT_GAS_LIMIT", "200000"))
-PAUSE_BETWEEN_ROUNDS = float(os.environ.get("PFFT_PAUSE_BETWEEN_ROUNDS", "5"))
+PAUSE_BETWEEN_ROUNDS = float(os.environ.get("PFFT_PAUSE_BETWEEN_ROUNDS", "0"))
+PRIORITY_FEE_GWEI = float(os.environ.get("PFFT_PRIORITY_FEE_GWEI", "3"))
+MAX_FEE_MULTIPLIER = float(os.environ.get("PFFT_MAX_FEE_MULTIPLIER", "2"))
+MAX_FEE_EXTRA_GWEI = float(os.environ.get("PFFT_MAX_FEE_EXTRA_GWEI", "3"))
+PRE_SUBMIT_CHALLENGE_CHECK = os.environ.get("PFFT_PRE_SUBMIT_CHALLENGE_CHECK", "1") != "0"
+PREFLIGHT_CALL = os.environ.get("PFFT_PREFLIGHT_CALL", "1") != "0"
 CUDA_BINARY = os.environ.get("PFFT_CUDA_BINARY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda_keccak_miner"))
 CUDA_BLOCK_SIZE = int(os.environ.get("CUDA_BLOCK_SIZE", "256"))
 CUDA_GRID_SIZE = int(os.environ.get("CUDA_GRID_SIZE", "65536"))
@@ -98,17 +103,47 @@ def get_challenge(contract, wallet_addr):
     return c if isinstance(c, bytes) else c.to_bytes(32, 'big')
 
 
+def build_fee_fields(w3) -> dict:
+    """Build aggressive EIP-1559 fee fields; fallback to legacy gasPrice if needed."""
+    priority = w3.to_wei(PRIORITY_FEE_GWEI, 'gwei')
+    extra = w3.to_wei(MAX_FEE_EXTRA_GWEI, 'gwei')
+    try:
+        latest = w3.eth.get_block('latest')
+        base = latest.get('baseFeePerGas')
+        if base is not None:
+            max_fee = int(base * MAX_FEE_MULTIPLIER) + priority + extra
+            return {
+                'maxPriorityFeePerGas': int(priority),
+                'maxFeePerGas': int(max_fee),
+            }
+    except Exception:
+        pass
+    return {'gasPrice': int(w3.eth.gas_price + priority + extra)}
+
+
 def submit_mint(w3, wallet, contract, nonce: int) -> bool:
     try:
         fn = contract.functions.freeMint(nonce)
+        fee_fields = build_fee_fields(w3)
+        if PREFLIGHT_CALL:
+            try:
+                fn.call({'from': wallet.address})
+            except Exception as e:
+                print(f"  ⚠️  Preflight revert, skip tx: {e}")
+                return False
+
         tx = fn.build_transaction({
             'from': wallet.address,
             'nonce': w3.eth.get_transaction_count(wallet.address),
             'chainId': CHAIN_ID,
             'gas': GAS_LIMIT,
+            **fee_fields,
         })
-        if 'maxFeePerGas' not in tx and 'maxPriorityFeePerGas' not in tx:
-            tx['gasPrice'] = w3.eth.gas_price
+
+        if 'maxFeePerGas' in tx:
+            print(f"  ⛽ fee max={tx['maxFeePerGas']/1e9:.2f} gwei | tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
+        else:
+            print(f"  ⛽ gasPrice={tx['gasPrice']/1e9:.2f} gwei")
 
         signed = wallet.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -252,6 +287,15 @@ def main():
             print(f"  ❌ GPU solve error: {e}")
             time.sleep(5)
             continue
+
+        if PRE_SUBMIT_CHALLENGE_CHECK:
+            try:
+                latest_challenge = get_challenge(contract, wallet.address)
+                if latest_challenge != challenge:
+                    print("  ⚠️  Challenge changed after solve, skip stale nonce and re-mine...")
+                    continue
+            except Exception as e:
+                print(f"  ⚠️  Challenge refresh error: {e}, continuing...")
 
         try:
             is_valid = contract.functions.isValidPow(wallet.address, nonce).call()
