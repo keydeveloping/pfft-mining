@@ -52,9 +52,42 @@ running = True
 w3 = None
 
 
+def log(msg: str = ""):
+    print(msg, flush=True)
+
+
+def short_hash(h) -> str:
+    s = h.hex() if hasattr(h, 'hex') else str(h)
+    if s.startswith('0x'):
+        s = s[2:]
+    return f"0x{s[:8]}...{s[-6:]}"
+
+
+def fmt_rate(rate_hs: float) -> str:
+    if rate_hs >= 1e9:
+        return f"{rate_hs/1e9:.2f} GH/s"
+    if rate_hs >= 1e6:
+        return f"{rate_hs/1e6:.2f} MH/s"
+    if rate_hs >= 1e3:
+        return f"{rate_hs/1e3:.2f} kH/s"
+    return f"{rate_hs:.0f} H/s"
+
+
+def clean_error(e) -> str:
+    text = str(e).replace("\n", " ")
+    for marker in ("execution reverted:", "revert"):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+            break
+    text = text.split("'0x", 1)[0].strip(" ()',")
+    if len(text) > 100:
+        text = text[:97] + "..."
+    return text or e.__class__.__name__
+
+
 def handle_signal(sig, frame):
     global running
-    print("\n  ⚠️  Stopping miner...")
+    log("\n[stop] stopping miner...")
     running = False
 
 
@@ -130,7 +163,7 @@ def submit_mint(w3, wallet, contract, nonce: int) -> bool:
             try:
                 fn.call({'from': wallet.address})
             except Exception as e:
-                print(f"  ⚠️  Preflight revert, skip tx: {e}")
+                log(f"[tx] preflight-skip reason={clean_error(e)}")
                 return False
 
         fee_fields = build_fee_fields(w3)
@@ -143,27 +176,26 @@ def submit_mint(w3, wallet, contract, nonce: int) -> bool:
         })
 
         if 'maxFeePerGas' in tx:
-            print(f"  ⛽ fee max={tx['maxFeePerGas']/1e9:.2f} gwei | tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
+            log(f"[tx] fee max={tx['maxFeePerGas']/1e9:.2f} tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
         else:
-            print(f"  ⛽ gasPrice={tx['gasPrice']/1e9:.2f} gwei")
+            log(f"[tx] gasPrice={tx['gasPrice']/1e9:.2f} gwei")
 
         signed = wallet.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        print(f"  📤 TX: https://etherscan.io/tx/0x{tx_hash.hex()}")
+        log(f"[tx] sent {short_hash(tx_hash)}")
 
         try:
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
             if receipt.status == 1:
-                print(f"  ✅ MINT OK | Block {receipt.blockNumber} | Gas {receipt.gasUsed}")
+                log(f"[tx] success block={receipt.blockNumber} gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
                 return True
-            print(f"  ❌ REVERTED | Gas {receipt.gasUsed}")
+            log(f"[tx] reverted gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
             return False
         except Exception as e:
-            print(f"  ⚠️  TX not mined after {RECEIPT_TIMEOUT}s, skip and continue: https://etherscan.io/tx/0x{tx_hash.hex()}")
-            print(f"  ⚠️  Wait error: {e}")
+            log(f"[tx] pending>{RECEIPT_TIMEOUT}s skip hash={short_hash(tx_hash)}")
             return False
     except Exception as e:
-        print(f"  ❌ TX error: {e}")
+        log(f"[tx] error reason={clean_error(e)}")
         return False
 
 
@@ -203,7 +235,7 @@ def solve_pow_cuda(challenge: bytes, target: int):
     attempts = int(result.get("attempts", "0"))
     elapsed = float(result.get("elapsed", "0"))
     rate = float(result.get("rate_hs", "0"))
-    print(f"\n  ✅ GPU FOUND nonce={nonce} | {attempts:,} attempts | {elapsed:.3f}s | {rate/1000:,.0f} kH/s")
+    log(f"[gpu] found nonce={nonce} tries={attempts:,} time={elapsed:.3f}s rate={fmt_rate(rate)}")
     return nonce, bytes.fromhex(result["hash"])
 
 
@@ -211,19 +243,15 @@ def main():
     from web3 import Web3
     from eth_account import Account
 
-    print("=" * 60)
-    print("  ⛏️  PFFT GPU Miner Bot — NVIDIA CUDA")
-    print(f"  Contract: {CONTRACT}")
-    print(f"  RPC: {RPC}")
-    print(f"  CUDA binary: {CUDA_BINARY}")
-    print("=" * 60)
+    log("PFFT GPU Miner — NVIDIA CUDA")
+    log(f"contract={CONTRACT} cuda={CUDA_BINARY}")
 
     global w3
     w3 = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
     if not w3.is_connected():
         print("❌ Cannot connect to RPC")
         sys.exit(1)
-    print(f"✅ Connected | Block #{w3.eth.block_number}")
+    log(f"connected block={w3.eth.block_number}")
 
     wallet_path = Path(WALLET_FILE)
     if wallet_path.exists():
@@ -233,7 +261,7 @@ def main():
         if not pk.startswith('0x'):
             pk = '0x' + pk
         wallet = Account.from_key(pk)
-        print(f"✅ Wallet: {wallet.address}")
+        log(f"wallet={wallet.address}")
     else:
         wallet = Account.create()
         wdata = {
@@ -246,22 +274,16 @@ def main():
         with open(wallet_path, 'w') as f:
             json.dump(wdata, f, indent=2)
         os.chmod(wallet_path, 0o600)
-        print(f"✅ New wallet: {wallet.address}")
-        print(f"   Saved: {wallet_path}")
+        log(f"new-wallet={wallet.address} saved={wallet_path}")
 
     eth_bal = w3.eth.get_balance(wallet.address) / 1e18
-    print(f"💰 ETH: {eth_bal:.6f}")
+    log(f"eth={eth_bal:.6f}")
     if eth_bal < 0.00005:
-        print("⚠️  Low ETH! Need ~0.00005+ ETH for gas")
+        log("warn=low-eth need~0.00005+")
 
     contract = load_contract(w3)
     s = get_status(contract, wallet.address)
-    print(f"\n📊 Contract:")
-    print(f"   Minted: {s['total_minted']/1e18:,.0f} / {s['max_supply']/1e18:,.0f} PFFT ({s['progress']:.1f}%)")
-    print(f"   Next mint: ~{s['next_mint']/1e18:,.2f} PFFT")
-    print(f"   Difficulty: {s['hex_zeros']} hex zeros ({s['difficulty_bits']}-bit)")
-    print(f"   Wallet minted: {s['wallet_minted']/1e18:,.2f} / 10,000 PFFT")
-    print(f"   Wallet balance: {s['wallet_bal']/1e18:,.2f} PFFT")
+    log(f"status supply={s['total_minted']/1e18:,.0f}/{s['max_supply']/1e18:,.0f} progress={s['progress']:.1f}% diff={s['difficulty_bits']} wallet_minted={s['wallet_minted']/1e18:,.2f} bal={s['wallet_bal']/1e18:,.2f}")
 
     round_num = 0
     total_minted_count = 0
@@ -270,31 +292,27 @@ def main():
 
     while running:
         round_num += 1
-        print(f"\n{'─'*60}")
-        print(f"  Round #{round_num}")
-        print(f"{'─'*60}")
-
         try:
             s = get_status(contract, wallet.address)
-            print(f"  Supply: {s['total_minted']/1e18:,.0f} ({s['progress']:.1f}%) | Next: ~{s['next_mint']/1e18:,.2f} PFFT | Diff: {s['difficulty_bits']}-bit")
+            log(f"[r{round_num}] supply={s['total_minted']/1e18:,.0f} progress={s['progress']:.1f}% reward={s['next_mint']/1e18:,.2f} diff={s['difficulty_bits']}")
             if s['total_minted'] >= s['max_supply']:
-                print("  🏁 Max supply reached!")
+                log(f"[r{round_num}] stop=max-supply")
                 break
             if s['wallet_minted'] >= 10_000 * 1e18:
-                print("  🏁 Wallet cap (10,000 PFFT) reached!")
+                log(f"[r{round_num}] stop=wallet-cap")
                 break
         except Exception as e:
-            print(f"  ⚠️  Status error: {e}, retrying in 15s...")
+            log(f"[r{round_num}] status-error reason={clean_error(e)} retry=15s")
             time.sleep(15)
             continue
 
         challenge = get_challenge(contract, wallet.address)
-        print(f"  🎮 GPU mining ({s['difficulty_bits']}-bit)...")
+        log(f"[r{round_num}] gpu-start")
 
         try:
             nonce, _ = solve_pow_cuda(challenge, s['target'])
         except Exception as e:
-            print(f"  ❌ GPU solve error: {e}")
+            log(f"[r{round_num}] gpu-error reason={clean_error(e)}")
             time.sleep(5)
             continue
 
@@ -302,44 +320,40 @@ def main():
             try:
                 latest_challenge = get_challenge(contract, wallet.address)
                 if latest_challenge != challenge:
-                    print("  ⚠️  Challenge changed after solve, skip stale nonce and re-mine...")
+                    log(f"[r{round_num}] stale-challenge skip")
                     continue
             except Exception as e:
-                print(f"  ⚠️  Challenge refresh error: {e}, continuing...")
+                log(f"[r{round_num}] challenge-refresh-error reason={clean_error(e)} continue")
 
         try:
             is_valid = contract.functions.isValidPow(wallet.address, nonce).call()
             if not is_valid:
-                print("  ⚠️  Nonce invalid on-chain (challenge changed?), re-mining...")
+                log(f"[r{round_num}] invalid-pow skip")
                 continue
         except Exception as e:
-            print(f"  ⚠️  Verify error: {e}, submitting anyway...")
+            log(f"[r{round_num}] verify-error reason={clean_error(e)} submit-anyway")
 
         success = submit_mint(w3, wallet, contract, nonce)
         if success:
             total_minted_count += 1
             earned = s['next_mint'] / 1e18
             total_pfft_earned += earned
-            print(f"  💰 +{earned:,.2f} PFFT | Total: {total_pfft_earned:,.2f} PFFT from {total_minted_count} mints")
+            log(f"[r{round_num}] reward +{earned:,.2f} total={total_pfft_earned:,.2f} mints={total_minted_count}")
             try:
                 bal = contract.functions.balanceOf(wallet.address).call()
-                print(f"  💰 PFFT balance: {bal/1e18:,.2f}")
+                log(f"[r{round_num}] balance={bal/1e18:,.2f}")
             except Exception:
                 pass
 
         elapsed = time.time() - global_start
-        print(f"\n  📈 Session: {total_minted_count} mints | {total_pfft_earned:,.2f} PFFT | {elapsed/60:.1f} min")
+        log(f"[r{round_num}] session mints={total_minted_count} earned={total_pfft_earned:,.2f} runtime={elapsed/60:.1f}m")
 
         if running:
-            print(f"  ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
+            if PAUSE_BETWEEN_ROUNDS > 0:
+                log(f"[r{round_num}] cooldown={PAUSE_BETWEEN_ROUNDS}s")
             time.sleep(PAUSE_BETWEEN_ROUNDS)
 
-    print(f"\n{'='*60}")
-    print("  Session Summary")
-    print(f"  Mints: {total_minted_count}")
-    print(f"  PFFT earned: {total_pfft_earned:,.2f}")
-    print(f"  Runtime: {(time.time()-global_start)/60:.1f} min")
-    print(f"{'='*60}")
+    log(f"summary mints={total_minted_count} earned={total_pfft_earned:,.2f} runtime={(time.time()-global_start)/60:.1f}m")
 
 
 if __name__ == "__main__":
