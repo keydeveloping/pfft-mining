@@ -47,9 +47,14 @@ CUDA_BLOCK_SIZE = int(os.environ.get("CUDA_BLOCK_SIZE", "256"))
 CUDA_GRID_SIZE = int(os.environ.get("CUDA_GRID_SIZE", "65536"))
 CUDA_BATCHES = int(os.environ.get("CUDA_BATCHES", "4096"))
 CUDA_GPU_ID = int(os.environ.get("CUDA_GPU_ID", "0"))
+STUCK_NONCE_THRESHOLD = int(os.environ.get("PFFT_STUCK_NONCE_THRESHOLD", "2"))
+STUCK_FEE_STEP_GWEI = float(os.environ.get("PFFT_STUCK_FEE_STEP_GWEI", "0.5"))
+STUCK_MAX_EXTRA_GWEI = float(os.environ.get("PFFT_STUCK_MAX_EXTRA_GWEI", "5"))
 
 running = True
 w3 = None
+pending_nonce_tracker = None
+pending_streak = 0
 
 
 def log(msg: str = ""):
@@ -138,36 +143,60 @@ def get_challenge(contract, wallet_addr):
     return c if isinstance(c, bytes) else c.to_bytes(32, 'big')
 
 
-def build_fee_fields(w3) -> dict:
-    """Build aggressive EIP-1559 fee fields; fallback to legacy gasPrice if needed."""
-    priority = int(w3.to_wei(PRIORITY_FEE_GWEI, 'gwei'))
-    extra = int(w3.to_wei(MAX_FEE_EXTRA_GWEI, 'gwei'))
+def build_fee_fields(w3, stuck_streak: int = 0) -> tuple[dict, dict]:
+    """Build EIP-1559 fee fields; add small nudge when same nonce keeps pending."""
+    nudge_gwei = 0.0
+    if stuck_streak >= STUCK_NONCE_THRESHOLD:
+        nudge_gwei = min((stuck_streak - STUCK_NONCE_THRESHOLD + 1) * STUCK_FEE_STEP_GWEI, STUCK_MAX_EXTRA_GWEI)
+
+    priority_gwei = PRIORITY_FEE_GWEI + nudge_gwei
+    extra_gwei = MAX_FEE_EXTRA_GWEI + nudge_gwei
+    priority = int(w3.to_wei(priority_gwei, 'gwei'))
+    extra = int(w3.to_wei(extra_gwei, 'gwei'))
+    meta = {
+        'priority_gwei': priority_gwei,
+        'extra_gwei': extra_gwei,
+        'nudge_gwei': nudge_gwei,
+        'stuck_streak': stuck_streak,
+    }
     try:
         latest = w3.eth.get_block('latest')
         base = latest.get('baseFeePerGas')
         if base is not None:
             max_fee = int(base * MAX_FEE_MULTIPLIER) + priority + extra
+            meta['base_gwei'] = base / 1e9
+            meta['max_gwei'] = max_fee / 1e9
             return {
                 'maxPriorityFeePerGas': int(priority),
                 'maxFeePerGas': int(max_fee),
-            }
+            }, meta
     except Exception:
         pass
-    return {'gasPrice': int(w3.eth.gas_price + priority + extra)}
+    gas_price = int(w3.eth.gas_price + priority + extra)
+    meta['max_gwei'] = gas_price / 1e9
+    return {'gasPrice': gas_price}, meta
 
 
 def submit_mint(w3, wallet, contract, nonce: int) -> bool:
+    global pending_nonce_tracker, pending_streak
     try:
         fn = contract.functions.freeMint(nonce)
         if PREFLIGHT_CALL:
             try:
                 fn.call({'from': wallet.address})
             except Exception as e:
-                log(f"[tx] preflight-skip reason={clean_error(e)}")
+                log(f"🧪 [tx] preflight=skip reason={clean_error(e)}")
                 return False
 
-        fee_fields = build_fee_fields(w3)
         account_nonce = w3.eth.get_transaction_count(wallet.address, 'latest')
+        if pending_nonce_tracker == account_nonce:
+            stuck_streak = pending_streak
+            if stuck_streak >= STUCK_NONCE_THRESHOLD:
+                log(f"🧱 [tx] stuck nonce={account_nonce} streak={stuck_streak} -> fee nudge active")
+        else:
+            stuck_streak = 0
+
+        fee_fields, fee_meta = build_fee_fields(w3, stuck_streak=stuck_streak)
         tx = fn.build_transaction({
             'from': wallet.address,
             # Use latest nonce so each new round replaces any still-pending tx instead of queueing behind it.
@@ -178,26 +207,39 @@ def submit_mint(w3, wallet, contract, nonce: int) -> bool:
         })
 
         if 'maxFeePerGas' in tx:
-            log(f"[tx] nonce={account_nonce} fee max={tx['maxFeePerGas']/1e9:.2f} tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
+            base = fee_meta.get('base_gwei')
+            base_txt = f" base={base:.2f}" if base is not None else ""
+            nudge_txt = f" nudge=+{fee_meta['nudge_gwei']:.2f}" if fee_meta['nudge_gwei'] else ""
+            log(f"⛽ [tx] nonce={account_nonce}{base_txt} max={tx['maxFeePerGas']/1e9:.2f} tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei{nudge_txt}")
         else:
-            log(f"[tx] nonce={account_nonce} gasPrice={tx['gasPrice']/1e9:.2f} gwei")
+            nudge_txt = f" nudge=+{fee_meta['nudge_gwei']:.2f}" if fee_meta['nudge_gwei'] else ""
+            log(f"⛽ [tx] nonce={account_nonce} gasPrice={tx['gasPrice']/1e9:.2f} gwei{nudge_txt}")
 
         signed = wallet.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        log(f"[tx] sent {short_hash(tx_hash)}")
+        log(f"📨 [tx] sent {short_hash(tx_hash)} wait={RECEIPT_TIMEOUT}s")
 
         try:
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
             if receipt.status == 1:
-                log(f"[tx] success block={receipt.blockNumber} gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
+                log(f"✅ [tx] success block={receipt.blockNumber} gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
+                pending_nonce_tracker = None
+                pending_streak = 0
                 return True
-            log(f"[tx] reverted gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
+            log(f"❌ [tx] reverted gas={receipt.gasUsed} hash={short_hash(tx_hash)}")
+            pending_nonce_tracker = None
+            pending_streak = 0
             return False
         except Exception as e:
-            log(f"[tx] pending>{RECEIPT_TIMEOUT}s skip hash={short_hash(tx_hash)}")
+            if pending_nonce_tracker == account_nonce:
+                pending_streak += 1
+            else:
+                pending_nonce_tracker = account_nonce
+                pending_streak = 1
+            log(f"⏳ [tx] pending>{RECEIPT_TIMEOUT}s nonce={account_nonce} streak={pending_streak} hash={short_hash(tx_hash)}")
             return False
     except Exception as e:
-        log(f"[tx] error reason={clean_error(e)}")
+        log(f"💥 [tx] error reason={clean_error(e)}")
         return False
 
 
@@ -237,7 +279,7 @@ def solve_pow_cuda(challenge: bytes, target: int):
     attempts = int(result.get("attempts", "0"))
     elapsed = float(result.get("elapsed", "0"))
     rate = float(result.get("rate_hs", "0"))
-    log(f"[gpu] found nonce={nonce} tries={attempts:,} time={elapsed:.3f}s rate={fmt_rate(rate)}")
+    log(f"✅ [gpu] found nonce={nonce} tries={attempts:,} time={elapsed:.3f}s rate={fmt_rate(rate)}")
     return nonce, bytes.fromhex(result["hash"])
 
 
@@ -245,15 +287,15 @@ def main():
     from web3 import Web3
     from eth_account import Account
 
-    log("PFFT GPU Miner — NVIDIA CUDA")
-    log(f"contract={CONTRACT} cuda={CUDA_BINARY}")
+    log("🚀 PFFT GPU Miner — NVIDIA CUDA")
+    log(f"🔗 contract={CONTRACT} cuda={CUDA_BINARY}")
 
     global w3
     w3 = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
     if not w3.is_connected():
         print("❌ Cannot connect to RPC")
         sys.exit(1)
-    log(f"connected block={w3.eth.block_number}")
+    log(f"✅ connected block={w3.eth.block_number}")
 
     wallet_path = Path(WALLET_FILE)
     if wallet_path.exists():
@@ -263,7 +305,7 @@ def main():
         if not pk.startswith('0x'):
             pk = '0x' + pk
         wallet = Account.from_key(pk)
-        log(f"wallet={wallet.address}")
+        log(f"👛 wallet={wallet.address}")
     else:
         wallet = Account.create()
         wdata = {
@@ -279,13 +321,13 @@ def main():
         log(f"new-wallet={wallet.address} saved={wallet_path}")
 
     eth_bal = w3.eth.get_balance(wallet.address) / 1e18
-    log(f"eth={eth_bal:.6f}")
+    log(f"🪙 eth={eth_bal:.6f}")
     if eth_bal < 0.00005:
         log("warn=low-eth need~0.00005+")
 
     contract = load_contract(w3)
     s = get_status(contract, wallet.address)
-    log(f"status supply={s['total_minted']/1e18:,.0f}/{s['max_supply']/1e18:,.0f} progress={s['progress']:.1f}% diff={s['difficulty_bits']} wallet_minted={s['wallet_minted']/1e18:,.2f} bal={s['wallet_bal']/1e18:,.2f}")
+    log(f"📊 status supply={s['total_minted']/1e18:,.0f}/{s['max_supply']/1e18:,.0f} progress={s['progress']:.1f}% diff={s['difficulty_bits']} wallet_minted={s['wallet_minted']/1e18:,.2f} bal={s['wallet_bal']/1e18:,.2f}")
 
     round_num = 0
     total_minted_count = 0
@@ -296,7 +338,8 @@ def main():
         round_num += 1
         try:
             s = get_status(contract, wallet.address)
-            log(f"[r{round_num}] supply={s['total_minted']/1e18:,.0f} progress={s['progress']:.1f}% reward={s['next_mint']/1e18:,.2f} diff={s['difficulty_bits']}")
+            log(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log(f"🔁 [r{round_num}] supply={s['total_minted']/1e18:,.0f} progress={s['progress']:.1f}% reward={s['next_mint']/1e18:,.2f} diff={s['difficulty_bits']}")
             if s['total_minted'] >= s['max_supply']:
                 log(f"[r{round_num}] stop=max-supply")
                 break
@@ -309,7 +352,7 @@ def main():
             continue
 
         challenge = get_challenge(contract, wallet.address)
-        log(f"[r{round_num}] gpu-start")
+        log(f"🎮 [r{round_num}] gpu-start offset=random window={CUDA_GRID_SIZE * CUDA_BLOCK_SIZE * CUDA_BATCHES:,}")
 
         try:
             nonce, _ = solve_pow_cuda(challenge, s['target'])
@@ -340,19 +383,19 @@ def main():
             total_minted_count += 1
             earned = s['next_mint'] / 1e18
             total_pfft_earned += earned
-            log(f"[r{round_num}] reward +{earned:,.2f} total={total_pfft_earned:,.2f} mints={total_minted_count}")
+            log(f"💰 [r{round_num}] reward=+{earned:,.2f} total={total_pfft_earned:,.2f} mints={total_minted_count}")
             try:
                 bal = contract.functions.balanceOf(wallet.address).call()
-                log(f"[r{round_num}] balance={bal/1e18:,.2f}")
+                log(f"🪙 [r{round_num}] balance={bal/1e18:,.2f}")
             except Exception:
                 pass
 
         elapsed = time.time() - global_start
-        log(f"[r{round_num}] session mints={total_minted_count} earned={total_pfft_earned:,.2f} runtime={elapsed/60:.1f}m")
+        log(f"📈 [r{round_num}] session mints={total_minted_count} earned={total_pfft_earned:,.2f} runtime={elapsed/60:.1f}m")
 
         if running:
             if PAUSE_BETWEEN_ROUNDS > 0:
-                log(f"[r{round_num}] cooldown={PAUSE_BETWEEN_ROUNDS}s")
+                log(f"☕ [r{round_num}] cooldown={PAUSE_BETWEEN_ROUNDS}s")
             time.sleep(PAUSE_BETWEEN_ROUNDS)
 
     log(f"summary mints={total_minted_count} earned={total_pfft_earned:,.2f} runtime={(time.time()-global_start)/60:.1f}m")
