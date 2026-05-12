@@ -39,9 +39,7 @@ PAUSE_BETWEEN_ROUNDS = float(os.environ.get("PFFT_PAUSE_BETWEEN_ROUNDS", "0"))
 PRIORITY_FEE_GWEI = float(os.environ.get("PFFT_PRIORITY_FEE_GWEI", "3"))
 MAX_FEE_MULTIPLIER = float(os.environ.get("PFFT_MAX_FEE_MULTIPLIER", "2"))
 MAX_FEE_EXTRA_GWEI = float(os.environ.get("PFFT_MAX_FEE_EXTRA_GWEI", "3"))
-RECEIPT_TIMEOUT = int(os.environ.get("PFFT_RECEIPT_TIMEOUT", "25"))
-GAS_BUMP_ATTEMPTS = int(os.environ.get("PFFT_GAS_BUMP_ATTEMPTS", "2"))
-GAS_BUMP_MULTIPLIER = float(os.environ.get("PFFT_GAS_BUMP_MULTIPLIER", "1.35"))
+RECEIPT_TIMEOUT = int(os.environ.get("PFFT_RECEIPT_TIMEOUT", "5"))
 PRE_SUBMIT_CHALLENGE_CHECK = os.environ.get("PFFT_PRE_SUBMIT_CHALLENGE_CHECK", "1") != "0"
 PREFLIGHT_CALL = os.environ.get("PFFT_PREFLIGHT_CALL", "1") != "0"
 CUDA_BINARY = os.environ.get("PFFT_CUDA_BINARY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda_keccak_miner"))
@@ -107,16 +105,15 @@ def get_challenge(contract, wallet_addr):
     return c if isinstance(c, bytes) else c.to_bytes(32, 'big')
 
 
-def build_fee_fields(w3, bump: int = 0) -> dict:
+def build_fee_fields(w3) -> dict:
     """Build aggressive EIP-1559 fee fields; fallback to legacy gasPrice if needed."""
-    bump_factor = GAS_BUMP_MULTIPLIER ** bump
-    priority = int(w3.to_wei(PRIORITY_FEE_GWEI, 'gwei') * bump_factor)
-    extra = int(w3.to_wei(MAX_FEE_EXTRA_GWEI, 'gwei') * bump_factor)
+    priority = int(w3.to_wei(PRIORITY_FEE_GWEI, 'gwei'))
+    extra = int(w3.to_wei(MAX_FEE_EXTRA_GWEI, 'gwei'))
     try:
         latest = w3.eth.get_block('latest')
         base = latest.get('baseFeePerGas')
         if base is not None:
-            max_fee = int(base * MAX_FEE_MULTIPLIER * bump_factor) + priority + extra
+            max_fee = int(base * MAX_FEE_MULTIPLIER) + priority + extra
             return {
                 'maxPriorityFeePerGas': int(priority),
                 'maxFeePerGas': int(max_fee),
@@ -136,42 +133,35 @@ def submit_mint(w3, wallet, contract, nonce: int) -> bool:
                 print(f"  ⚠️  Preflight revert, skip tx: {e}")
                 return False
 
-        account_nonce = w3.eth.get_transaction_count(wallet.address, 'pending')
-        last_hash = None
-        for bump in range(GAS_BUMP_ATTEMPTS + 1):
-            fee_fields = build_fee_fields(w3, bump=bump)
-            tx = fn.build_transaction({
-                'from': wallet.address,
-                'nonce': account_nonce,
-                'chainId': CHAIN_ID,
-                'gas': GAS_LIMIT,
-                **fee_fields,
-            })
+        fee_fields = build_fee_fields(w3)
+        tx = fn.build_transaction({
+            'from': wallet.address,
+            'nonce': w3.eth.get_transaction_count(wallet.address, 'pending'),
+            'chainId': CHAIN_ID,
+            'gas': GAS_LIMIT,
+            **fee_fields,
+        })
 
-            if 'maxFeePerGas' in tx:
-                print(f"  ⛽ fee max={tx['maxFeePerGas']/1e9:.2f} gwei | tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei | bump={bump}")
-            else:
-                print(f"  ⛽ gasPrice={tx['gasPrice']/1e9:.2f} gwei | bump={bump}")
+        if 'maxFeePerGas' in tx:
+            print(f"  ⛽ fee max={tx['maxFeePerGas']/1e9:.2f} gwei | tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
+        else:
+            print(f"  ⛽ gasPrice={tx['gasPrice']/1e9:.2f} gwei")
 
-            signed = wallet.sign_transaction(tx)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            last_hash = tx_hash
-            print(f"  📤 TX: https://etherscan.io/tx/0x{tx_hash.hex()}")
+        signed = wallet.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print(f"  📤 TX: https://etherscan.io/tx/0x{tx_hash.hex()}")
 
-            try:
-                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
-                if receipt.status == 1:
-                    print(f"  ✅ MINT OK | Block {receipt.blockNumber} | Gas {receipt.gasUsed}")
-                    return True
-                print(f"  ❌ REVERTED | Gas {receipt.gasUsed}")
-                return False
-            except Exception as e:
-                if bump < GAS_BUMP_ATTEMPTS:
-                    print(f"  ⚠️  Receipt timeout after {RECEIPT_TIMEOUT}s, bumping gas and replacing tx...")
-                    continue
-                print(f"  ⚠️  TX pending after {RECEIPT_TIMEOUT}s: https://etherscan.io/tx/0x{last_hash.hex()}")
-                print(f"  ⚠️  Last wait error: {e}")
-                return False
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
+            if receipt.status == 1:
+                print(f"  ✅ MINT OK | Block {receipt.blockNumber} | Gas {receipt.gasUsed}")
+                return True
+            print(f"  ❌ REVERTED | Gas {receipt.gasUsed}")
+            return False
+        except Exception as e:
+            print(f"  ⚠️  TX not mined after {RECEIPT_TIMEOUT}s, skip and continue: https://etherscan.io/tx/0x{tx_hash.hex()}")
+            print(f"  ⚠️  Wait error: {e}")
+            return False
     except Exception as e:
         print(f"  ❌ TX error: {e}")
         return False
