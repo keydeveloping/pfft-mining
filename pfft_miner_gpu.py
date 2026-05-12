@@ -167,18 +167,20 @@ def submit_mint(w3, wallet, contract, nonce: int) -> bool:
                 return False
 
         fee_fields = build_fee_fields(w3)
+        account_nonce = w3.eth.get_transaction_count(wallet.address, 'latest')
         tx = fn.build_transaction({
             'from': wallet.address,
-            'nonce': w3.eth.get_transaction_count(wallet.address, 'pending'),
+            # Use latest nonce so each new round replaces any still-pending tx instead of queueing behind it.
+            'nonce': account_nonce,
             'chainId': CHAIN_ID,
             'gas': GAS_LIMIT,
             **fee_fields,
         })
 
         if 'maxFeePerGas' in tx:
-            log(f"[tx] fee max={tx['maxFeePerGas']/1e9:.2f} tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
+            log(f"[tx] nonce={account_nonce} fee max={tx['maxFeePerGas']/1e9:.2f} tip={tx['maxPriorityFeePerGas']/1e9:.2f} gwei")
         else:
-            log(f"[tx] gasPrice={tx['gasPrice']/1e9:.2f} gwei")
+            log(f"[tx] nonce={account_nonce} gasPrice={tx['gasPrice']/1e9:.2f} gwei")
 
         signed = wallet.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
