@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
     int block_size = 256;
     int grid_size = 65536;
     uint64_t batches = 4096;
+    uint64_t cli_start_nonce = 0;
     int gpu_id = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -166,10 +167,12 @@ int main(int argc, char **argv) {
             grid_size = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--batches") && i + 1 < argc) {
             batches = strtoull(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--start-nonce") && i + 1 < argc) {
+            cli_start_nonce = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--gpu-id") && i + 1 < argc) {
             gpu_id = atoi(argv[++i]);
         } else {
-            fprintf(stderr, "usage: %s --challenge <64hex> --target <64hex> [--block-size 256] [--grid-size 65536] [--batches 4096] [--gpu-id 0]\n", argv[0]);
+            fprintf(stderr, "usage: %s --challenge <64hex> --target <64hex> [--start-nonce N] [--block-size 256] [--grid-size 65536] [--batches 4096] [--gpu-id 0]\n", argv[0]);
             return 2;
         }
     }
@@ -192,7 +195,7 @@ int main(int argc, char **argv) {
     uint64_t threads = (uint64_t)grid_size * (uint64_t)block_size;
     uint64_t iters_per_thread = batches;
     uint64_t window_attempts = threads * iters_per_thread;
-    uint64_t start_nonce = 0;
+    uint64_t start_nonce = cli_start_nonce;
     uint64_t total_attempts = 0;
     double t0 = now_sec();
     unsigned int found = 0;

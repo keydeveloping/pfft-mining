@@ -19,6 +19,7 @@ import json
 import time
 import signal
 import subprocess
+import secrets
 from pathlib import Path
 
 _env_path = Path(__file__).parent / ".env"
@@ -163,10 +164,12 @@ def solve_pow_cuda(challenge: bytes, target: int):
     if not os.path.exists(CUDA_BINARY):
         raise FileNotFoundError(f"CUDA binary not found: {CUDA_BINARY}. Run ./build.sh first")
 
+    start_nonce = secrets.randbits(63)
     cmd = [
         CUDA_BINARY,
         "--challenge", challenge.hex(),
         "--target", f"{target:064x}",
+        "--start-nonce", str(start_nonce),
         "--block-size", str(CUDA_BLOCK_SIZE),
         "--grid-size", str(CUDA_GRID_SIZE),
         "--batches", str(CUDA_BATCHES),
